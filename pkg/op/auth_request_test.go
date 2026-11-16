@@ -1,0 +1,1891 @@
+package op_test
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"reflect"
+	"testing"
+
+	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/zitadel/oidc/v3/example/server/storage"
+	tu "github.com/zitadel/oidc/v3/internal/testutil"
+	httphelper "github.com/zitadel/oidc/v3/pkg/http"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
+	"github.com/zitadel/oidc/v3/pkg/op"
+	"github.com/zitadel/oidc/v3/pkg/op/mock"
+	"github.com/zitadel/schema"
+)
+
+func TestAuthorize(t *testing.T) {
+	tests := []struct {
+		name   string
+		req    *http.Request
+		expect func(a *mock.MockAuthorizerMockRecorder)
+	}{
+		{
+			name: "parse error", // used to panic, see issue #315
+			req:  httptest.NewRequest(http.MethodPost, "/?;", nil),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			authorizer := mock.NewMockAuthorizer(gomock.NewController(t))
+
+			expect := authorizer.EXPECT()
+			expect.Decoder().Return(schema.NewDecoder())
+
+			if tt.expect != nil {
+				tt.expect(expect)
+			}
+
+			op.Authorize(w, tt.req, authorizer)
+		})
+	}
+}
+
+// customAuthorizeValidator is an Authorizer that also implements
+// AuthorizeValidator, replacing the default validation closure in Authorize.
+type customAuthorizeValidator struct {
+	*mock.MockAuthorizer
+	validate func(context.Context, *oidc.AuthRequest, op.Storage, *op.IDTokenHintVerifier) (string, error)
+}
+
+func (c *customAuthorizeValidator) ValidateAuthRequest(ctx context.Context, authReq *oidc.AuthRequest, storage op.Storage, verifier *op.IDTokenHintVerifier) (string, error) {
+	return c.validate(ctx, authReq, storage, verifier)
+}
+
+type stubAuthRequest struct {
+	op.AuthRequest
+	id string
+}
+
+func (s *stubAuthRequest) GetID() string { return s.id }
+
+// newAcceptingValidator returns a custom AuthorizeValidator that accepts every
+// request without assigning Authorize's local client variable.
+func newAcceptingValidator(ctrl *gomock.Controller, storage op.Storage) *customAuthorizeValidator {
+	authorizer := &customAuthorizeValidator{
+		MockAuthorizer: mock.NewMockAuthorizer(ctrl),
+		validate: func(context.Context, *oidc.AuthRequest, op.Storage, *op.IDTokenHintVerifier) (string, error) {
+			return "userID", nil
+		},
+	}
+	expect := authorizer.MockAuthorizer.EXPECT()
+	expect.Decoder().Return(schema.NewDecoder())
+	expect.Encoder().Return(schema.NewEncoder()).AnyTimes()
+	expect.Storage().Return(storage).AnyTimes()
+	expect.IDTokenHintVerifier(gomock.Any()).Return(nil)
+	return authorizer
+}
+
+// TestAuthorizeCustomValidator authorizes with an Authorizer that implements
+// AuthorizeValidator. The custom validator replaces the default validation
+// closure, which is what assigns Authorize's local client, so Authorize must
+// resolve the client itself before RedirectToLogin dereferences it.
+// Used to panic with a nil-pointer dereference, see issue #909.
+func TestAuthorizeCustomValidator(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	storage := mock.NewMockStorage(ctrl)
+	client := mock.NewMockClient(ctrl)
+
+	authorizer := newAcceptingValidator(ctrl, storage)
+
+	storage.EXPECT().GetClientByClientID(gomock.Any(), "native").Return(client, nil)
+	storage.EXPECT().CreateAuthRequest(gomock.Any(), gomock.Any(), "userID").Return(&stubAuthRequest{id: "authReqID"}, nil)
+	client.EXPECT().LoginURL("authReqID").Return("/login?authRequestID=authReqID")
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/authorize?client_id=native&redirect_uri=http%3A%2F%2Flocalhost%3A9999%2Fcallback&scope=openid&response_type=code",
+		nil)
+	w := httptest.NewRecorder()
+	op.Authorize(w, req, authorizer)
+
+	resp := w.Result()
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+	assert.Equal(t, "/login?authRequestID=authReqID", resp.Header.Get("Location"))
+}
+
+// TestAuthorizeCustomValidatorClientLookupError covers the fallback client
+// lookup failing after a custom AuthorizeValidator succeeded. Because the
+// library cannot assume the custom validator verified the redirect_uri, the
+// error must be rendered directly instead of redirecting to the (potentially
+// unvalidated) redirect_uri, which would be an open redirect.
+func TestAuthorizeCustomValidatorClientLookupError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	storage := mock.NewMockStorage(ctrl)
+
+	authorizer := newAcceptingValidator(ctrl, storage)
+
+	storage.EXPECT().GetClientByClientID(gomock.Any(), "native").Return(nil, errors.New("client not found"))
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/authorize?client_id=native&redirect_uri=http%3A%2F%2Flocalhost%3A9999%2Fcallback&scope=openid&response_type=code",
+		nil)
+	w := httptest.NewRecorder()
+	op.Authorize(w, req, authorizer)
+
+	resp := w.Result()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Location"))
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "unable to retrieve client by id")
+}
+
+// TestAuthorizeCustomValidatorCodeChallengeMethod covers a custom
+// AuthorizeValidator that accepts an unsupported code_challenge_method.
+// Authorize must still reject it before the auth request is stored, and only
+// redirect the error to a redirect_uri registered for the client.
+func TestAuthorizeCustomValidatorCodeChallengeMethod(t *testing.T) {
+	const state = "custom-state"
+	tests := []struct {
+		name        string
+		appType     op.ApplicationType
+		registered  string
+		redirectURI string
+		// wantDelivered is false when the error must be rendered at the
+		// endpoint instead of being redirected.
+		wantDelivered bool
+	}{
+		{
+			name:          "registered redirect_uri",
+			appType:       op.ApplicationTypeWeb,
+			registered:    "https://registered.com/callback",
+			redirectURI:   "https://registered.com/callback",
+			wantDelivered: true,
+		},
+		{
+			name:        "unregistered redirect_uri",
+			appType:     op.ApplicationTypeWeb,
+			registered:  "https://registered.com/callback",
+			redirectURI: "https://evil.com/callback",
+		},
+		{
+			// A native app picks a free port at runtime (RFC 8252, section
+			// 7.3), so a loopback redirect on another port is registered.
+			name:          "native loopback redirect_uri on another port",
+			appType:       op.ApplicationTypeNative,
+			registered:    "http://127.0.0.1/callback",
+			redirectURI:   "http://127.0.0.1:51004/callback",
+			wantDelivered: true,
+		},
+		{
+			// Registered, though ValidateAuthReqRedirectURI's policy would
+			// refuse an http redirect_uri for a native client: only whether it
+			// is registered decides where the error goes.
+			name:          "registered native http redirect_uri",
+			appType:       op.ApplicationTypeNative,
+			registered:    "http://app.example.com/callback",
+			redirectURI:   "http://app.example.com/callback",
+			wantDelivered: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			storage := mock.NewMockStorage(ctrl)
+			client := mock.NewClientWithConfig(t, []string{tt.registered},
+				tt.appType, []oidc.ResponseType{oidc.ResponseTypeCode}, false)
+			// accepts the request without checking the code_challenge_method
+			authorizer := newAcceptingValidator(ctrl, storage)
+
+			// CreateAuthRequest is not expected: the request must not be stored.
+			storage.EXPECT().GetClientByClientID(gomock.Any(), "client").Return(client, nil)
+
+			req := httptest.NewRequest(http.MethodGet, "/authorize?"+url.Values{
+				"client_id":             {"client"},
+				"redirect_uri":          {tt.redirectURI},
+				"scope":                 {"openid"},
+				"response_type":         {"code"},
+				"state":                 {state},
+				"code_challenge":        {"challenge"},
+				"code_challenge_method": {"S512"},
+			}.Encode(), nil)
+			w := httptest.NewRecorder()
+			op.Authorize(w, req, authorizer)
+
+			if tt.wantDelivered {
+				assertDeliveredTo(t, w, tt.redirectURI, state, "invalid_request")
+				return
+			}
+			resp := w.Result()
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Empty(t, resp.Header.Get("Location"))
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			assert.Contains(t, string(body), "code_challenge_method is not supported")
+		})
+	}
+}
+
+func TestParseAuthorizeRequest(t *testing.T) {
+	type args struct {
+		r       *http.Request
+		decoder httphelper.Decoder
+	}
+	type res struct {
+		want *oidc.AuthRequest
+		err  bool
+	}
+	tests := []struct {
+		name string
+		args args
+		res  res
+	}{
+		{
+			"parsing form error",
+			args{
+				&http.Request{URL: &url.URL{RawQuery: "invalid=%%param"}},
+				schema.NewDecoder(),
+			},
+			res{
+				nil,
+				true,
+			},
+		},
+		{
+			"decoding error",
+			args{
+				&http.Request{URL: &url.URL{RawQuery: "unknown=value"}},
+				func() httphelper.Decoder {
+					decoder := schema.NewDecoder()
+					decoder.IgnoreUnknownKeys(false)
+					return decoder
+				}(),
+			},
+			res{
+				nil,
+				true,
+			},
+		},
+		{
+			"parsing ok",
+			args{
+				&http.Request{URL: &url.URL{RawQuery: "scope=openid"}},
+				func() httphelper.Decoder {
+					decoder := schema.NewDecoder()
+					decoder.IgnoreUnknownKeys(false)
+					return decoder
+				}(),
+			},
+			res{
+				&oidc.AuthRequest{Scopes: oidc.SpaceDelimitedArray{"openid"}},
+				false,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := op.ParseAuthorizeRequest(tt.args.r, tt.args.decoder)
+			if (err != nil) != tt.res.err {
+				t.Errorf("ParseAuthorizeRequest() error = %v, wantErr %v", err, tt.res.err)
+			}
+			if !reflect.DeepEqual(got, tt.res.want) {
+				t.Errorf("ParseAuthorizeRequest() got = %v, want %v", got, tt.res.want)
+			}
+		})
+	}
+}
+
+func TestValidateAuthRequest(t *testing.T) {
+	type args struct {
+		authRequest *oidc.AuthRequest
+		storage     op.Storage
+		verifier    *op.IDTokenHintVerifier
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr error
+	}{
+		{
+			"scope missing fails",
+			args{&oidc.AuthRequest{}, mock.NewMockStorageExpectValidClientID(t), nil},
+			oidc.ErrInvalidRequest(),
+		},
+		{
+			"response_type missing fails",
+			args{&oidc.AuthRequest{Scopes: []string{"openid"}}, mock.NewMockStorageExpectValidClientID(t), nil},
+			oidc.ErrInvalidRequest(),
+		},
+		{
+			"client_id missing fails",
+			args{&oidc.AuthRequest{Scopes: []string{"openid"}, ResponseType: oidc.ResponseTypeCode}, mock.NewMockStorageExpectValidClientID(t), nil},
+			oidc.ErrInvalidRequest(),
+		},
+		{
+			"redirect_uri missing fails",
+			args{&oidc.AuthRequest{Scopes: []string{"openid"}, ResponseType: oidc.ResponseTypeCode, ClientID: "client_id"}, mock.NewMockStorageExpectValidClientID(t), nil},
+			oidc.ErrInvalidRequest(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := op.ValidateAuthRequest(context.TODO(), tt.args.authRequest, tt.args.storage, tt.args.verifier)
+			if tt.wantErr == nil && err != nil {
+				t.Errorf("ValidateAuthRequest() unexpected error = %v", err)
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Errorf("ValidateAuthRequest() unexpected error = %v, want = %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateAuthReqPrompt(t *testing.T) {
+	type args struct {
+		prompts []string
+		maxAge  *uint
+	}
+	type res struct {
+		maxAge *uint
+		err    error
+	}
+	tests := []struct {
+		name string
+		args args
+		res  res
+	}{
+		{
+			"no prompts and maxAge, ok",
+			args{
+				nil,
+				nil,
+			},
+			res{
+				nil,
+				nil,
+			},
+		},
+		{
+			"no prompts but maxAge, ok",
+			args{
+				nil,
+				oidc.NewMaxAge(10),
+			},
+			res{
+				oidc.NewMaxAge(10),
+				nil,
+			},
+		},
+		{
+			"prompt none, ok",
+			args{
+				[]string{"none"},
+				oidc.NewMaxAge(10),
+			},
+			res{
+				oidc.NewMaxAge(10),
+				nil,
+			},
+		},
+		{
+			"prompt none with others, err",
+			args{
+				[]string{"none", "login"},
+				oidc.NewMaxAge(10),
+			},
+			res{
+				nil,
+				oidc.ErrInvalidRequest(),
+			},
+		},
+		{
+			"prompt login, ok",
+			args{
+				[]string{"login"},
+				nil,
+			},
+			res{
+				oidc.NewMaxAge(0),
+				nil,
+			},
+		},
+		{
+			"prompt login with maxAge, ok",
+			args{
+				[]string{"login"},
+				oidc.NewMaxAge(10),
+			},
+			res{
+				oidc.NewMaxAge(0),
+				nil,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			maxAge, err := op.ValidateAuthReqPrompt(tt.args.prompts, tt.args.maxAge)
+			if tt.res.err == nil && err != nil {
+				t.Errorf("ValidateAuthRequest() unexpected error = %v", err)
+			}
+			if tt.res.err != nil && !errors.Is(err, tt.res.err) {
+				t.Errorf("ValidateAuthRequest() unexpected error = %v, want = %v", err, tt.res.err)
+			}
+			assert.Equal(t, tt.res.maxAge, maxAge)
+		})
+	}
+}
+
+func TestValidateAuthReqScopes(t *testing.T) {
+	type args struct {
+		client op.Client
+		scopes []string
+	}
+	type res struct {
+		err    bool
+		scopes []string
+	}
+	tests := []struct {
+		name string
+		args args
+		res  res
+	}{
+		{
+			"scopes missing fails",
+			args{},
+			res{
+				err: true,
+			},
+		},
+		{
+			"scope ok",
+			args{
+				mock.NewClientExpectAny(t, op.ApplicationTypeWeb),
+				[]string{"openid"},
+			},
+			res{
+				scopes: []string{"openid"},
+			},
+		},
+		{
+			"scope with drop ok",
+			args{
+				mock.NewClientExpectAny(t, op.ApplicationTypeWeb),
+				[]string{"openid", "email", "unknown"},
+			},
+			res{
+				scopes: []string{"openid", "email"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scopes, err := op.ValidateAuthReqScopes(tt.args.client, tt.args.scopes)
+			if (err != nil) != tt.res.err {
+				t.Errorf("ValidateAuthReqScopes() error = %v, wantErr %v", err, tt.res.err)
+			}
+			assert.ElementsMatch(t, scopes, tt.res.scopes)
+		})
+	}
+}
+
+func TestValidateAuthReqRedirectURI(t *testing.T) {
+	type args struct {
+		uri          string
+		client       op.Client
+		responseType oidc.ResponseType
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		{
+			"empty fails",
+			args{
+				"",
+				mock.NewClientWithConfig(t, []string{"https://registered.com/callback"}, op.ApplicationTypeWeb, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			"unregistered https fails",
+			args{
+				"https://unregistered.com/callback",
+				mock.NewClientWithConfig(t, []string{"https://registered.com/callback"}, op.ApplicationTypeWeb, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			"unregistered http fails",
+			args{
+				"http://unregistered.com/callback",
+				mock.NewClientWithConfig(t, []string{"http://registered.com/callback"}, op.ApplicationTypeWeb, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			"code flow registered https web ok",
+			args{
+				"https://registered.com/callback",
+				mock.NewClientWithConfig(t, []string{"https://registered.com/callback"}, op.ApplicationTypeWeb, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow registered https native ok",
+			args{
+				"https://registered.com/callback",
+				mock.NewClientWithConfig(t, []string{"https://registered.com/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow registered https user agent ok",
+			args{
+				"https://registered.com/callback",
+				mock.NewClientWithConfig(t, []string{"https://registered.com/callback"}, op.ApplicationTypeUserAgent, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow registered http confidential (web) ok",
+			args{
+				"http://registered.com/callback",
+				mock.NewClientWithConfig(t, []string{"http://registered.com/callback"}, op.ApplicationTypeWeb, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow registered http not confidential (native) fails",
+			args{
+				"http://registered.com/callback",
+				mock.NewClientWithConfig(t, []string{"http://registered.com/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			"code flow registered http not confidential (user agent) fails",
+			args{
+				"http://registered.com/callback",
+				mock.NewClientWithConfig(t, []string{"http://registered.com/callback"}, op.ApplicationTypeUserAgent, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			"code flow registered http localhost native ok",
+			args{
+				"http://localhost:4200/callback",
+				mock.NewClientWithConfig(t, []string{"http://localhost/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow registered http loopback v4 native ok",
+			args{
+				"http://127.0.0.1:4200/callback",
+				mock.NewClientWithConfig(t, []string{"http://127.0.0.1/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow registered http loopback v6 native ok",
+			args{
+				"http://[::1]:4200/callback",
+				mock.NewClientWithConfig(t, []string{"http://[::1]/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow registered https loopback v4 native ok",
+			args{
+				"https://127.0.0.1:4200/callback",
+				mock.NewClientWithConfig(t, []string{"https://127.0.0.1/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow registered https loopback v6 native ok",
+			args{
+				"https://[::1]:4200/callback",
+				mock.NewClientWithConfig(t, []string{"https://[::1]/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow unregistered http native fails",
+			args{
+				"http://unregistered.com/callback",
+				mock.NewClientWithConfig(t, []string{"http://locahost/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			"code flow unregistered custom native fails",
+			args{
+				"unregistered://callback",
+				mock.NewClientWithConfig(t, []string{"registered://callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			"code flow unregistered loopback native fails",
+			args{
+				"http://[::1]:4200/unregistered",
+				mock.NewClientWithConfig(t, []string{"http://[::1]:4200/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			"code flow registered custom not native (web) fails",
+			args{
+				"custom://callback",
+				mock.NewClientWithConfig(t, []string{"custom://callback"}, op.ApplicationTypeWeb, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			"code flow registered custom not native (user agent) fails",
+			args{
+				"custom://callback",
+				mock.NewClientWithConfig(t, []string{"custom://callback"}, op.ApplicationTypeUserAgent, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			"code flow registered custom native ok",
+			args{
+				"custom://callback",
+				mock.NewClientWithConfig(t, []string{"custom://callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow dev mode http ok",
+			args{
+				"http://registered.com/callback",
+				mock.NewClientWithConfig(t, []string{"http://registered.com/callback"}, op.ApplicationTypeUserAgent, nil, true),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"implicit flow registered ok",
+			args{
+				"https://registered.com/callback",
+				mock.NewClientWithConfig(t, []string{"https://registered.com/callback"}, op.ApplicationTypeUserAgent, nil, false),
+				oidc.ResponseTypeIDToken,
+			},
+			false,
+		},
+		{
+			"implicit flow unregistered fails",
+			args{
+				"https://unregistered.com/callback",
+				mock.NewClientWithConfig(t, []string{"https://registered.com/callback"}, op.ApplicationTypeUserAgent, nil, false),
+				oidc.ResponseTypeIDToken,
+			},
+			true,
+		},
+		{
+			"implicit flow registered http localhost native ok",
+			args{
+				"http://localhost:9999/callback",
+				mock.NewClientWithConfig(t, []string{"http://localhost:9999/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeIDToken,
+			},
+			false,
+		},
+		{
+			"implicit flow registered http localhost web fails",
+			args{
+				"http://localhost:9999/callback",
+				mock.NewClientWithConfig(t, []string{"http://localhost:9999/callback"}, op.ApplicationTypeWeb, nil, false),
+				oidc.ResponseTypeIDToken,
+			},
+			true,
+		},
+		{
+			"implicit flow registered http localhost user agent fails",
+			args{
+				"http://localhost:9999/callback",
+				mock.NewClientWithConfig(t, []string{"http://localhost:9999/callback"}, op.ApplicationTypeUserAgent, nil, false),
+				oidc.ResponseTypeIDToken,
+			},
+			true,
+		},
+		{
+			"implicit flow http non localhost fails",
+			args{
+				"http://registered.com/callback",
+				mock.NewClientWithConfig(t, []string{"http://registered.com/callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeIDToken,
+			},
+			true,
+		},
+		{
+			"implicit flow custom fails",
+			args{
+				"custom://callback",
+				mock.NewClientWithConfig(t, []string{"custom://callback"}, op.ApplicationTypeNative, nil, false),
+				oidc.ResponseTypeIDToken,
+			},
+			false,
+		},
+		{
+			"implicit flow dev mode http ok",
+			args{
+				"http://registered.com/callback",
+				mock.NewClientWithConfig(t, []string{"http://registered.com/callback"}, op.ApplicationTypeUserAgent, nil, true),
+				oidc.ResponseTypeIDToken,
+			},
+			false,
+		},
+		{
+			"code flow dev mode has redirect globs regular ok",
+			args{
+				"http://registered.com/callback",
+				mock.NewHasRedirectGlobsWithConfig(t, []string{"http://registered.com/*"}, op.ApplicationTypeUserAgent, nil, true),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow dev mode has redirect globs wildcard ok",
+			args{
+				"http://registered.com/callback",
+				mock.NewHasRedirectGlobsWithConfig(t, []string{"http://registered.com/*"}, op.ApplicationTypeUserAgent, nil, true),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow dev mode has redirect globs double star ok",
+			args{
+				"http://registered.com/callback",
+				mock.NewHasRedirectGlobsWithConfig(t, []string{"http://**/*"}, op.ApplicationTypeUserAgent, nil, true),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow dev mode has redirect globs double star ok",
+			args{
+				"http://registered.com/callback",
+				mock.NewHasRedirectGlobsWithConfig(t, []string{"http://**/*"}, op.ApplicationTypeUserAgent, nil, true),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow dev mode has redirect globs IPv6 ok",
+			args{
+				"http://[::1]:80/callback",
+				mock.NewHasRedirectGlobsWithConfig(t, []string{"http://\\[::1\\]:80/*"}, op.ApplicationTypeUserAgent, nil, true),
+				oidc.ResponseTypeCode,
+			},
+			false,
+		},
+		{
+			"code flow dev mode has redirect globs bad pattern",
+			args{
+				"http://registered.com/callback",
+				mock.NewHasRedirectGlobsWithConfig(t, []string{"http://**/\\"}, op.ApplicationTypeUserAgent, nil, true),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+		{
+			// A redirect_uri reaches this validator already decoded by
+			// r.ParseForm, so a percent-encoded literal denotes a
+			// different URI than the one registered and must not match.
+			// Guards against re-introducing a second decode here; see #968.
+			"code flow percent-encoded redirect_uri does not match",
+			args{
+				"https%3A%2F%2Fregistered.com%2Fcallback",
+				mock.NewClientWithConfig(t, []string{"https://registered.com/callback"}, op.ApplicationTypeWeb, nil, false),
+				oidc.ResponseTypeCode,
+			},
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := op.ValidateAuthReqRedirectURI(tt.args.client, tt.args.uri, tt.args.responseType); (err != nil) != tt.wantErr {
+				t.Errorf("ValidateRedirectURI() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoopbackOrLocalhost(t *testing.T) {
+	type args struct {
+		url string
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			"not parsable, false",
+			args{url: string('\n')},
+			false,
+		},
+		{
+			"not http, false",
+			args{url: "localhost/test"},
+			false,
+		},
+		{
+			"not http, false",
+			args{url: "http://localhost.com/test"},
+			false,
+		},
+		{
+			"v4 no port ok",
+			args{url: "http://127.0.0.1/test"},
+			true,
+		},
+		{
+			"v6 short no port ok",
+			args{url: "http://[::1]/test"},
+			true,
+		},
+		{
+			"v6 long no port ok",
+			args{url: "http://[0:0:0:0:0:0:0:1]/test"},
+			true,
+		},
+		{
+			"localhost no port ok",
+			args{url: "http://localhost/test"},
+			true,
+		},
+		{
+			"v4 with port ok",
+			args{url: "http://127.0.0.1:4200/test"},
+			true,
+		},
+		{
+			"v6 short with port ok",
+			args{url: "http://[::1]:4200/test"},
+			true,
+		},
+		{
+			"v6 long with port ok",
+			args{url: "http://[0:0:0:0:0:0:0:1]:4200/test"},
+			true,
+		},
+		{
+			"localhost with port ok",
+			args{url: "http://localhost:4200/test"},
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, got := op.HTTPLoopbackOrLocalhost(tt.args.url); got != tt.want {
+				t.Errorf("loopbackOrLocalhost() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateAuthReqResponseType(t *testing.T) {
+	type args struct {
+		responseType oidc.ResponseType
+		client       op.Client
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		{
+			"empty response type",
+			args{
+				"",
+				mock.NewClientWithConfig(t, nil, op.ApplicationTypeNative, []oidc.ResponseType{oidc.ResponseTypeCode}, true),
+			},
+			true,
+		},
+		{
+			"response type missing in client config",
+			args{
+				oidc.ResponseTypeIDToken,
+				mock.NewClientWithConfig(t, nil, op.ApplicationTypeNative, []oidc.ResponseType{oidc.ResponseTypeCode}, true),
+			},
+			true,
+		},
+		{
+			"valid response type",
+			args{
+				oidc.ResponseTypeCode,
+				mock.NewClientWithConfig(t, nil, op.ApplicationTypeNative, []oidc.ResponseType{oidc.ResponseTypeCode}, true),
+			},
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := op.ValidateAuthReqResponseType(tt.args.client, tt.args.responseType); (err != nil) != tt.wantErr {
+				t.Errorf("ValidateAuthReqScopes() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateAuthReqCodeChallengeMethod(t *testing.T) {
+	tests := []struct {
+		name      string
+		challenge string
+		method    oidc.CodeChallengeMethod
+		wantErr   bool
+	}{
+		{name: "no method defaults to plain", challenge: "challenge", method: "", wantErr: false},
+		{name: "plain", challenge: "challenge", method: oidc.CodeChallengeMethodPlain, wantErr: false},
+		{name: "S256", challenge: "challenge", method: oidc.CodeChallengeMethodS256, wantErr: false},
+		{name: "lower-case s256", challenge: "challenge", method: "s256", wantErr: true},
+		{name: "S512", challenge: "challenge", method: "S512", wantErr: true},
+		{name: "unknown", challenge: "challenge", method: "unknown", wantErr: true},
+		// Without a code_challenge there is nothing to downgrade.
+		{name: "unsupported method without challenge", challenge: "", method: "S512", wantErr: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := op.ValidateAuthReqCodeChallengeMethod(tt.challenge, tt.method)
+			if !tt.wantErr {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, oidc.ErrInvalidRequest())
+			// The method is caller input and must not be echoed (RFC 6749,
+			// section 4.1.2.1, restricts the characters of error_description).
+			var oidcErr *oidc.Error
+			require.ErrorAs(t, err, &oidcErr)
+			assert.NotContains(t, oidcErr.Description, string(tt.method))
+		})
+	}
+}
+
+// TestValidateAuthRequestClientCodeChallengeMethod covers the check in
+// ValidateAuthRequestClient itself, without the backstop in Authorize.
+func TestValidateAuthRequestClientCodeChallengeMethod(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  oidc.CodeChallengeMethod
+		wantErr bool
+	}{
+		{name: "S256", method: oidc.CodeChallengeMethodS256, wantErr: false},
+		{name: "S512", method: "S512", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := mock.NewClientWithConfig(t, []string{"https://registered.com/callback"},
+				op.ApplicationTypeWeb, []oidc.ResponseType{oidc.ResponseTypeCode}, false)
+			authReq := &oidc.AuthRequest{
+				Scopes:              oidc.SpaceDelimitedArray{oidc.ScopeOpenID},
+				ResponseType:        oidc.ResponseTypeCode,
+				ClientID:            "web",
+				RedirectURI:         "https://registered.com/callback",
+				CodeChallenge:       "challenge",
+				CodeChallengeMethod: tt.method,
+			}
+			_, err := op.ValidateAuthRequestClient(context.Background(), authReq, client, nil)
+			if !tt.wantErr {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, oidc.ErrInvalidRequest())
+		})
+	}
+}
+
+func TestRedirectToLogin(t *testing.T) {
+	type args struct {
+		authReqID string
+		client    op.Client
+		w         http.ResponseWriter
+		r         *http.Request
+	}
+	tests := []struct {
+		name string
+		args args
+	}{
+		{
+			"redirect ok",
+			args{
+				"id",
+				mock.NewClientExpectAny(t, op.ApplicationTypeNative),
+				httptest.NewRecorder(),
+				httptest.NewRequest("GET", "/authorize", nil),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op.RedirectToLogin(tt.args.authReqID, tt.args.client, tt.args.w, tt.args.r)
+			rec := tt.args.w.(*httptest.ResponseRecorder)
+			require.Equal(t, http.StatusFound, rec.Code)
+			require.Equal(t, "/login?id=id", rec.Header().Get("location"))
+		})
+	}
+}
+
+func TestAuthResponseURL(t *testing.T) {
+	type args struct {
+		redirectURI  string
+		responseType oidc.ResponseType
+		responseMode oidc.ResponseMode
+		response     any
+		encoder      httphelper.Encoder
+	}
+	type res struct {
+		url string
+		err error
+	}
+	tests := []struct {
+		name string
+		args args
+		res  res
+	}{
+		{
+			"encoding error",
+			args{
+				"uri",
+				oidc.ResponseTypeCode,
+				"",
+				map[string]any{"test": "test"},
+				&mockEncoder{
+					errors.New("error encoding"),
+				},
+			},
+			res{
+				"",
+				oidc.ErrServerError(),
+			},
+		},
+		{
+			"response mode query",
+			args{
+				"uri",
+				oidc.ResponseTypeIDToken,
+				oidc.ResponseModeQuery,
+				map[string][]string{"test": {"test"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri?test=test",
+				nil,
+			},
+		},
+		{
+			"response mode fragment",
+			args{
+				"uri",
+				oidc.ResponseTypeCode,
+				oidc.ResponseModeFragment,
+				map[string][]string{"test": {"test"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri#test=test",
+				nil,
+			},
+		},
+		{
+			"response mode fragment with values that need escaping",
+			args{
+				"uri",
+				oidc.ResponseTypeCode,
+				oidc.ResponseModeFragment,
+				map[string][]string{"state": {"PADTEST=="}, "test": {"a b/c&d"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri#state=PADTEST%3D%3D&test=a+b%2Fc%26d",
+				nil,
+			},
+		},
+		{
+			"response type id token with values that need escaping",
+			args{
+				"uri?param=value",
+				oidc.ResponseTypeIDToken,
+				"",
+				map[string][]string{"state": {"eyJ0IjoxfQ=="}},
+				&mockEncoder{},
+			},
+			res{
+				"uri?param=value#state=eyJ0IjoxfQ%3D%3D",
+				nil,
+			},
+		},
+		{
+			"response type code",
+			args{
+				"uri",
+				oidc.ResponseTypeCode,
+				"",
+				map[string][]string{"test": {"test"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri?test=test",
+				nil,
+			},
+		},
+		{
+			"response type id token",
+			args{
+				"uri",
+				oidc.ResponseTypeIDToken,
+				"",
+				map[string][]string{"test": {"test"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri#test=test",
+				nil,
+			},
+		},
+		{
+			"with query",
+			args{
+				"uri?param=value",
+				oidc.ResponseTypeCode,
+				"",
+				map[string][]string{"test": {"test"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri?param=value&test=test",
+				nil,
+			},
+		},
+		{
+			"with query response type id token",
+			args{
+				"uri?param=value",
+				oidc.ResponseTypeIDToken,
+				"",
+				map[string][]string{"test": {"test"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri?param=value#test=test",
+				nil,
+			},
+		},
+		{
+			"with existing query",
+			args{
+				"uri?test=value",
+				oidc.ResponseTypeCode,
+				"",
+				map[string][]string{"test": {"test"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri?test=value&test=test",
+				nil,
+			},
+		},
+		{
+			"with existing query response type id token",
+			args{
+				"uri?test=value",
+				oidc.ResponseTypeIDToken,
+				"",
+				map[string][]string{"test": {"test"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri?test=value#test=test",
+				nil,
+			},
+		},
+		{
+			"with existing query and multiple values",
+			args{
+				"uri?test=value",
+				oidc.ResponseTypeCode,
+				"",
+				map[string][]string{"test": {"test", "test2"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri?test=value&test=test&test=test2",
+				nil,
+			},
+		},
+		{
+			"with existing query and multiple values response type id token",
+			args{
+				"uri?test=value",
+				oidc.ResponseTypeIDToken,
+				"",
+				map[string][]string{"test": {"test", "test2"}},
+				&mockEncoder{},
+			},
+			res{
+				"uri?test=value#test=test&test=test2",
+				nil,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := op.AuthResponseURL(tt.args.redirectURI, tt.args.responseType, tt.args.responseMode, tt.args.response, tt.args.encoder)
+			if tt.res.err == nil && err != nil {
+				t.Errorf("ValidateAuthRequest() unexpected error = %v", err)
+			}
+			if tt.res.err != nil && !errors.Is(err, tt.res.err) {
+				t.Errorf("ValidateAuthRequest() unexpected error = %v, want = %v", err, tt.res.err)
+			}
+			if got != tt.res.url {
+				t.Errorf("AuthResponseURL() got = %v, want %v", got, tt.res.url)
+			}
+		})
+	}
+}
+
+type mockEncoder struct {
+	err error
+}
+
+func (m *mockEncoder) Encode(src any, dst map[string][]string) error {
+	if m.err != nil {
+		return m.err
+	}
+	for s, strings := range src.(map[string][]string) {
+		dst[s] = strings
+	}
+	return nil
+}
+
+// mockCrypto implements the op.Crypto interface
+// and in always equals out. (It doesn't crypt anything).
+// When returnErr != nil, that error is always returned instead.
+type mockCrypto struct {
+	returnErr error
+}
+
+func (c *mockCrypto) Encrypt(s string) (string, error) {
+	if c.returnErr != nil {
+		return "", c.returnErr
+	}
+	return s, nil
+}
+
+func (c *mockCrypto) Decrypt(s string) (string, error) {
+	if c.returnErr != nil {
+		return "", c.returnErr
+	}
+	return s, nil
+}
+
+func TestAuthResponseCode(t *testing.T) {
+	type args struct {
+		authReq    op.AuthRequest
+		authorizer func(*testing.T) op.Authorizer
+	}
+	type res struct {
+		wantCode               int
+		wantLocationHeader     string
+		wantCacheControlHeader string
+		wantBody               string
+	}
+	tests := []struct {
+		name string
+		args args
+		res  res
+	}{
+		{
+			name: "create code error",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:            "id1",
+					TransferState: "state1",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{
+						returnErr: io.ErrClosedPipe,
+					})
+					return authorizer
+				},
+			},
+			res: res{
+				wantCode: http.StatusBadRequest,
+				wantBody: "io: read/write on closed pipe\n",
+			},
+		},
+		{
+			name: "success with state",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:            "id1",
+					TransferState: "state1",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					authorizer.EXPECT().Encoder().Return(schema.NewEncoder())
+					return authorizer
+				},
+			},
+			res: res{
+				wantCode:           http.StatusFound,
+				wantLocationHeader: "/auth/callback/?code=id1&state=state1",
+				wantBody:           "",
+			},
+		},
+		{
+			name: "success with state and session_state",
+			args: args{
+				authReq: &storage.AuthRequestWithSessionState{
+					AuthRequest: &storage.AuthRequest{
+						ID:            "id1",
+						TransferState: "state1",
+					},
+					SessionState: "session_state1",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					authorizer.EXPECT().Encoder().Return(schema.NewEncoder())
+					return authorizer
+				},
+			},
+			res: res{
+				wantCode:           http.StatusFound,
+				wantLocationHeader: "/auth/callback/?code=id1&session_state=session_state1&state=state1",
+				wantBody:           "",
+			},
+		},
+		{
+			name: "success without state", // reproduce issue #415
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:            "id1",
+					TransferState: "",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					authorizer.EXPECT().Encoder().Return(schema.NewEncoder())
+					return authorizer
+				},
+			},
+			res: res{
+				wantCode:           http.StatusFound,
+				wantLocationHeader: "/auth/callback/?code=id1",
+				wantBody:           "",
+			},
+		},
+		{
+			name: "success form_post",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:            "id1",
+					CallbackURI:   "https://example.com/callback",
+					TransferState: "state1",
+					ResponseMode:  "form_post",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					authorizer.EXPECT().Encoder().Return(schema.NewEncoder())
+					return authorizer
+				},
+			},
+			res: res{
+				wantCode:               http.StatusOK,
+				wantCacheControlHeader: "no-store",
+				wantBody:               "<!doctype html>\n<html>\n<head><meta charset=\"UTF-8\" /></head>\n<body onload=\"javascript:document.forms[0].submit()\">\n<form method=\"post\" action=\"https://example.com/callback\">\n<input type=\"hidden\" name=\"state\" value=\"state1\"/>\n<input type=\"hidden\" name=\"code\" value=\"id1\" />\n\n\n\n\n</form>\n</body>\n</html>",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/auth/callback/", nil)
+			w := httptest.NewRecorder()
+			op.AuthResponseCode(w, r, tt.args.authReq, tt.args.authorizer(t))
+			resp := w.Result()
+			defer resp.Body.Close()
+			assert.Equal(t, tt.res.wantCode, resp.StatusCode)
+			assert.Equal(t, tt.res.wantLocationHeader, resp.Header.Get("Location"))
+			assert.Equal(t, tt.res.wantCacheControlHeader, resp.Header.Get("Cache-Control"))
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			assert.Equal(t, tt.res.wantBody, string(body))
+		})
+	}
+}
+
+func Test_parseAuthorizeCallbackRequest(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantId  string
+		wantErr bool
+	}{
+		{
+			name:    "parse error",
+			url:     "/?id;=99",
+			wantErr: true,
+		},
+		{
+			name:    "missing id",
+			url:     "/",
+			wantErr: true,
+		},
+		{
+			name:   "ok",
+			url:    "/?id=99",
+			wantId: "99",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, tt.url, nil)
+			gotId, err := op.ParseAuthorizeCallbackRequest(r)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantId, gotId)
+		})
+	}
+}
+
+func TestBuildAuthResponseCodeResponsePayload(t *testing.T) {
+	type args struct {
+		authReq    op.AuthRequest
+		authorizer func(*testing.T) op.Authorizer
+	}
+	type res struct {
+		wantCode         string
+		wantState        string
+		wantSessionState string
+		wantErr          bool
+	}
+	tests := []struct {
+		name string
+		args args
+		res  res
+	}{
+		{
+			name: "create code error",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID: "id1",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{
+						returnErr: io.ErrClosedPipe,
+					})
+					return authorizer
+				},
+			},
+			res: res{
+				wantErr: true,
+			},
+		},
+		{
+			name: "success with state",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:            "id1",
+					TransferState: "state1",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					return authorizer
+				},
+			},
+			res: res{
+				wantCode:  "id1",
+				wantState: "state1",
+			},
+		},
+		{
+			name: "success without state",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:            "id1",
+					TransferState: "",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					return authorizer
+				},
+			},
+			res: res{
+				wantCode:  "id1",
+				wantState: "",
+			},
+		},
+		{
+			name: "success with session_state",
+			args: args{
+				authReq: &storage.AuthRequestWithSessionState{
+					AuthRequest: &storage.AuthRequest{
+						ID:            "id1",
+						TransferState: "state1",
+					},
+					SessionState: "session_state1",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					return authorizer
+				},
+			},
+			res: res{
+				wantCode:         "id1",
+				wantState:        "state1",
+				wantSessionState: "session_state1",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := op.BuildAuthResponseCodeResponsePayload(context.Background(), tt.args.authReq, tt.args.authorizer(t))
+			if tt.res.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.res.wantCode, got.Code)
+			assert.Equal(t, tt.res.wantState, got.State)
+			assert.Equal(t, tt.res.wantSessionState, got.SessionState)
+		})
+	}
+}
+
+func TestValidateAuthReqIDTokenHint(t *testing.T) {
+	token, _ := tu.ValidIDToken()
+	tests := []struct {
+		name        string
+		idTokenHint string
+		want        string
+		wantErr     error
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:        "verify err",
+			idTokenHint: "foo",
+			wantErr:     oidc.ErrLoginRequired(),
+		},
+		{
+			name:        "ok",
+			idTokenHint: token,
+			want:        tu.ValidSubject,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := op.ValidateAuthReqIDTokenHint(context.Background(), tt.idTokenHint, op.NewIDTokenHintVerifier(tu.ValidIssuer, tu.KeySet{}))
+			require.ErrorIs(t, err, tt.wantErr)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestBuildAuthResponseCallbackURL(t *testing.T) {
+	type args struct {
+		authReq    op.AuthRequest
+		authorizer func(*testing.T) op.Authorizer
+	}
+	type res struct {
+		wantURL string
+		wantErr bool
+	}
+	tests := []struct {
+		name string
+		args args
+		res  res
+	}{
+		{
+			name: "error when generating code response",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID: "id1",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{
+						returnErr: io.ErrClosedPipe,
+					})
+					return authorizer
+				},
+			},
+			res: res{
+				wantErr: true,
+			},
+		},
+		{
+			name: "error when generating callback URL",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:          "id1",
+					CallbackURI: "://invalid-url",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					authorizer.EXPECT().Encoder().Return(schema.NewEncoder())
+					return authorizer
+				},
+			},
+			res: res{
+				wantErr: true,
+			},
+		},
+		{
+			name: "success with state",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:            "id1",
+					CallbackURI:   "https://example.com/callback",
+					TransferState: "state1",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					authorizer.EXPECT().Encoder().Return(schema.NewEncoder())
+					return authorizer
+				},
+			},
+			res: res{
+				wantURL: "https://example.com/callback?code=id1&state=state1",
+				wantErr: false,
+			},
+		},
+		{
+			name: "success without state",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:          "id1",
+					CallbackURI: "https://example.com/callback",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					authorizer.EXPECT().Encoder().Return(schema.NewEncoder())
+					return authorizer
+				},
+			},
+			res: res{
+				wantURL: "https://example.com/callback?code=id1",
+				wantErr: false,
+			},
+		},
+		{
+			name: "success with session_state",
+			args: args{
+				authReq: &storage.AuthRequestWithSessionState{
+					AuthRequest: &storage.AuthRequest{
+						ID:            "id1",
+						CallbackURI:   "https://example.com/callback",
+						TransferState: "state1",
+					},
+					SessionState: "session_state1",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					authorizer.EXPECT().Encoder().Return(schema.NewEncoder())
+					return authorizer
+				},
+			},
+			res: res{
+				wantURL: "https://example.com/callback?code=id1&session_state=session_state1&state=state1",
+				wantErr: false,
+			},
+		},
+		{
+			name: "success with existing query parameters",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:            "id1",
+					CallbackURI:   "https://example.com/callback?param=value",
+					TransferState: "state1",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					authorizer.EXPECT().Encoder().Return(schema.NewEncoder())
+					return authorizer
+				},
+			},
+			res: res{
+				wantURL: "https://example.com/callback?param=value&code=id1&state=state1",
+				wantErr: false,
+			},
+		},
+		{
+			name: "success with fragment response mode",
+			args: args{
+				authReq: &storage.AuthRequest{
+					ID:            "id1",
+					CallbackURI:   "https://example.com/callback",
+					TransferState: "state1",
+					ResponseMode:  "fragment",
+				},
+				authorizer: func(t *testing.T) op.Authorizer {
+					ctrl := gomock.NewController(t)
+					storage := mock.NewMockStorage(ctrl)
+					storage.EXPECT().SaveAuthCode(gomock.Any(), "id1", "id1")
+
+					authorizer := mock.NewMockAuthorizer(ctrl)
+					authorizer.EXPECT().Storage().Return(storage)
+					authorizer.EXPECT().Crypto().Return(&mockCrypto{})
+					authorizer.EXPECT().Encoder().Return(schema.NewEncoder())
+					return authorizer
+				},
+			},
+			res: res{
+				wantURL: "https://example.com/callback#code=id1&state=state1",
+				wantErr: false,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := op.BuildAuthResponseCallbackURL(context.Background(), tt.args.authReq, tt.args.authorizer(t))
+			if tt.res.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			if tt.res.wantURL != "" {
+				// Parse the URLs to compare components instead of direct string comparison
+				expectedURL, err := url.Parse(tt.res.wantURL)
+				require.NoError(t, err)
+				actualURL, err := url.Parse(got)
+				require.NoError(t, err)
+
+				// Compare the base parts (scheme, host, path)
+				assert.Equal(t, expectedURL.Scheme, actualURL.Scheme)
+				assert.Equal(t, expectedURL.Host, actualURL.Host)
+				assert.Equal(t, expectedURL.Path, actualURL.Path)
+
+				// Compare the fragment if any
+				assert.Equal(t, expectedURL.Fragment, actualURL.Fragment)
+
+				// For query parameters, compare them independently of order
+				expectedQuery := expectedURL.Query()
+				actualQuery := actualURL.Query()
+
+				assert.Equal(t, len(expectedQuery), len(actualQuery), "Query parameter count does not match")
+
+				for key, expectedValues := range expectedQuery {
+					actualValues, exists := actualQuery[key]
+					assert.True(t, exists, "Expected query parameter %s not found", key)
+					assert.ElementsMatch(t, expectedValues, actualValues, "Values for parameter %s don't match", key)
+				}
+			}
+		})
+	}
+}
