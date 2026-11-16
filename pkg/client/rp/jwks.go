@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
 
@@ -15,8 +16,14 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
+// DefaultFetchTimeout bounds a single shared fetch of the remote key set.
+// It belongs to the key set itself, not to any caller's context, so that a
+// slow JWKS endpoint cannot make the shared fetch (and its goroutine) hang
+// forever once the fetch is detached from caller cancellation.
+const DefaultFetchTimeout = 10 * time.Second
+
 func NewRemoteKeySet(client *http.Client, jwksURL string, opts ...func(*remoteKeySet)) oidc.KeySet {
-	keyset := &remoteKeySet{httpClient: client, jwksURL: jwksURL}
+	keyset := &remoteKeySet{httpClient: client, jwksURL: jwksURL, fetchTimeout: DefaultFetchTimeout}
 	for _, opt := range opts {
 		opt(keyset)
 	}
@@ -35,11 +42,23 @@ func SkipRemoteCheck() func(set *remoteKeySet) {
 	}
 }
 
+// WithFetchTimeout sets the timeout for a single shared fetch of the remote
+// key set. The timeout is owned by the key set, not by any caller's context:
+// the fetch is shared by all waiting callers and must not be canceled when a
+// single caller goes away. A zero or negative value disables the timeout (not
+// recommended: a hung JWKS endpoint would then leak the fetch goroutine).
+func WithFetchTimeout(timeout time.Duration) func(set *remoteKeySet) {
+	return func(set *remoteKeySet) {
+		set.fetchTimeout = timeout
+	}
+}
+
 type remoteKeySet struct {
 	jwksURL         string
 	httpClient      *http.Client
 	defaultAlg      string
 	skipRemoteCheck bool
+	fetchTimeout    time.Duration
 
 	// guard all other fields
 	mu sync.Mutex
@@ -176,14 +195,30 @@ func (r *remoteKeySet) keysFromRemote(ctx context.Context) ([]jose.JSONWebKey, e
 	if r.inflight == nil {
 		r.inflight = newInflight()
 
+		// The fetch is shared by all current and future waiters on this
+		// inflight request, so it must not be canceled when a single caller
+		// (including this one) goes away: that would poison the shared
+		// result with context.Canceled for every other waiter. Detach
+		// cancellation from the caller's context while keeping its values
+		// (e.g. tracing spans), and bound the fetch with the key set's own
+		// timeout instead.
+		fetchCtx := context.WithoutCancel(ctx)
+		cancel := context.CancelFunc(func() {})
+		if r.fetchTimeout > 0 {
+			fetchCtx, cancel = context.WithTimeout(fetchCtx, r.fetchTimeout)
+		}
+
 		// This goroutine has exclusive ownership over the current inflight
 		// request. It releases the resource by nil'ing the inflight field
 		// once the goroutine is done.
-		go r.updateKeys(ctx)
+		go r.updateKeys(fetchCtx, cancel)
 	}
 	inflight := r.inflight
 	r.mu.Unlock()
 
+	// Each waiter keeps waiting on its own context: a caller whose context
+	// is canceled stops waiting, but never affects the shared fetch or the
+	// other waiters.
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -192,7 +227,9 @@ func (r *remoteKeySet) keysFromRemote(ctx context.Context) ([]jose.JSONWebKey, e
 	}
 }
 
-func (r *remoteKeySet) updateKeys(ctx context.Context) {
+func (r *remoteKeySet) updateKeys(ctx context.Context, cancel context.CancelFunc) {
+	defer cancel()
+
 	ctx, span := client.Tracer.Start(ctx, "updateKeys")
 	defer span.End()
 

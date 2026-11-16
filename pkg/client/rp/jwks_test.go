@@ -2,11 +2,15 @@ package rp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/stretchr/testify/assert"
@@ -136,4 +140,94 @@ func TestRemoteKeySet_VerifySignature_WrapsFetchError(t *testing.T) {
 			assert.ErrorIs(t, err, tt.wantErr)
 		})
 	}
+}
+
+// TestRemoteKeySet_FirstCallerCancelDoesNotPoisonWaiters verifies that when
+// the caller that started the shared inflight key fetch cancels its context,
+// the fetch itself keeps running and all other waiters still receive the
+// fetched keys.
+func TestRemoteKeySet_FirstCallerCancelDoesNotPoisonWaiters(t *testing.T) {
+	payload, err := tu.Signer.Sign([]byte(`{"sub":"subject"}`))
+	require.NoError(t, err)
+	token, err := payload.CompactSerialize()
+	require.NoError(t, err)
+	jws, err := jose.ParseSignedCompact(token, []jose.SignatureAlgorithm{tu.SignatureAlgorithm})
+	require.NoError(t, err)
+
+	keySetJSON, err := json.Marshal(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{tu.WebKey.Public()}})
+	require.NoError(t, err)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		close(entered)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(string(keySetJSON))),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Request:    r,
+		}, nil
+	})
+	keySet := NewRemoteKeySet(&http.Client{Transport: transport}, "https://example.com/keys")
+
+	type result struct {
+		payload []byte
+		err     error
+	}
+
+	// First caller: starts the shared inflight fetch, then gets canceled.
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	res1 := make(chan result, 1)
+	go func() {
+		p, err := keySet.VerifySignature(ctx1, jws)
+		res1 <- result{p, err}
+	}()
+
+	// Wait until the fetch is actually in flight, then register more waiters
+	// on the same inflight request.
+	<-entered
+	const waiters = 8
+	waiterRes := make(chan result, waiters)
+	var wg sync.WaitGroup
+	for i := 0; i < waiters; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p, err := keySet.VerifySignature(context.Background(), jws)
+			waiterRes <- result{p, err}
+		}()
+	}
+	// Give the waiters a chance to attach to the inflight request.
+	time.Sleep(100 * time.Millisecond)
+
+	// Cancel the first caller: its wait must abort, but the shared fetch and
+	// all other waiters must not be affected.
+	cancel1()
+	select {
+	case r := <-res1:
+		require.ErrorIs(t, r.err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("first caller did not return after context cancellation")
+	}
+
+	// Let the fetch complete; every waiter must get the verified payload.
+	close(release)
+	want, err := jws.Verify(tu.WebKey.Public())
+	require.NoError(t, err)
+	wg.Wait()
+	for i := 0; i < waiters; i++ {
+		r := <-waiterRes
+		require.NoError(t, r.err)
+		assert.Equal(t, want, r.payload)
+	}
+
+	// The fetch must have been shared: exactly one HTTP call for all callers.
+	assert.Equal(t, int32(1), calls.Load())
 }
